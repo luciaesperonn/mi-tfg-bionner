@@ -4,4 +4,5 @@ __pycache__/
 *.pyc
 outputs/
 .env
-data/
+# data/
+data/english/eng_dev_blind.txt

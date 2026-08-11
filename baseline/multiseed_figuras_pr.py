@@ -97,10 +97,13 @@ fig, ax = plt.subplots(figsize=(8, 6.5))
 for i, (key, label) in enumerate(ENCODERS):
     color = COLORS[i % len(COLORS)]
     g = df_full[df_full["exp"] == key].groupby("threshold")[["precision_bin", "recall_bin"]].mean()
-    # cierre con los extremos triviales: threshold=1 -> (recall=0, precision=1
-    # por convencion, igual que sklearn); threshold=0 -> (recall=1, precision=prevalencia)
-    recall = np.concatenate([[0.0], g["recall_bin"].values, [1.0]])
-    precision = np.concatenate([[1.0], g["precision_bin"].values, [PREVALENCE]])
+    # cierre con los extremos triviales: threshold->0 (recall=1, precision=
+    # prevalencia) va PRIMERO porque los datos reales van de threshold bajo
+    # (recall alto) a threshold alto (recall bajo); threshold->1 (recall=0,
+    # precision=1 por convencion sklearn) va AL FINAL. Ponerlos al reves crea
+    # un salto hacia atras en el eje X y la curva se ve con bucles.
+    recall = np.concatenate([[1.0], g["recall_bin"].values, [0.0]])
+    precision = np.concatenate([[PREVALENCE], g["precision_bin"].values, [1.0]])
     aucpr = auc_trapz(recall, precision)
     ax.plot(recall, precision, color=color, linewidth=2,
             label=f"{label} (AUC-PR={aucpr:.3f})")
@@ -125,9 +128,11 @@ fig, ax = plt.subplots(figsize=(8, 6.5))
 for i, (key, label) in enumerate(ENCODERS):
     color = COLORS[i % len(COLORS)]
     g = df_full[df_full["exp"] == key].groupby("threshold")[["fpr_bin", "recall_bin"]].mean()
-    # cierre con los extremos triviales: threshold=1 -> (0,0); threshold=0 -> (1,1) exactos
-    fpr = np.concatenate([[0.0], g["fpr_bin"].values, [1.0]])
-    tpr = np.concatenate([[0.0], g["recall_bin"].values, [1.0]])
+    # cierre con los extremos triviales: threshold->0 -> (fpr=1,tpr=1) va
+    # PRIMERO (datos reales empiezan con fpr/tpr altos, threshold bajo);
+    # threshold->1 -> (fpr=0,tpr=0) va AL FINAL. Mismo motivo que en la curva PR.
+    fpr = np.concatenate([[1.0], g["fpr_bin"].values, [0.0]])
+    tpr = np.concatenate([[1.0], g["recall_bin"].values, [0.0]])
     aucroc = auc_trapz(fpr, tpr)
     ax.plot(fpr, tpr, color=color, linewidth=2,
             label=f"{label} (AUC-ROC={aucroc:.3f})")

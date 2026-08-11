@@ -67,15 +67,14 @@ def rows_from_preds(pred_ids):
     ]
 
 
-def f1_at(probs, threshold):
+def eval_at(probs, threshold):
     pred_ids = preds_at_threshold(probs, threshold)
-    res = evaluate(pd.DataFrame(rows_from_preds(pred_ids)), gold_df_blind)
-    return res["macro_f1"]
+    return evaluate(pd.DataFrame(rows_from_preds(pred_ids)), gold_df_blind)
 
 
 def analyze_one(exp, seed, npy_path):
     probs = np.load(npy_path)
-    sweep = [(th, f1_at(probs, th)) for th in FINE_GRID]
+    sweep = [(th, eval_at(probs, th)["macro_f1"]) for th in FINE_GRID]
     best_th, best_f1 = max(sweep, key=lambda x: x[1])
     at_edge = best_th == FINE_GRID[-1]
 
@@ -84,6 +83,10 @@ def analyze_one(exp, seed, npy_path):
     ref_pair = min(sweep, key=lambda x: abs(x[0] - ref_th))
     drop = best_f1 - ref_pair[1]
     shape = "MESETA (robusto)" if drop < 0.02 else ("PICO AFILADO (fragil)" if drop > 0.05 else "intermedio")
+
+    # desglose por relacion EN EL THRESHOLD OPTIMO (no en argmax) -- antes se
+    # descartaba, solo se guardaba el macro_f1 agregado
+    per_relation = eval_at(probs, best_th)["per_relation"]
 
     return {
         "exp": exp, "seed": seed,
@@ -94,11 +97,13 @@ def analyze_one(exp, seed, npy_path):
         "caida_f1": round(drop, 4),
         "forma_curva": shape,
         "n_puntos_grid": len(FINE_GRID),
+        "per_relation": per_relation,
     }
 
 
 def main():
     rows = []
+    per_rel_rows = []
     for cfg in MULTISEED_CONFIGS:
         for seed in SEEDS:
             out_dir = REPO / "outputs" / cfg["base_outdir"] / f"seed{seed}"
@@ -111,6 +116,13 @@ def main():
                   f"macro_f1_fino={r['macro_f1_fino']:.4f}  "
                   f"{'BORDE DEL GRID FINO -- revisar mas alla de 0.9999' if r['en_borde_del_grid_fino'] else ''}  "
                   f"forma={r['forma_curva']} (caida={r['caida_f1']:.4f})", flush=True)
+            per_relation = r.pop("per_relation")
+            for rel, m in per_relation.items():
+                per_rel_rows.append({
+                    "exp": r["exp"], "seed": r["seed"], "relation": rel,
+                    "precision": m["precision"], "recall": m["recall"],
+                    "f1": m["f1"], "support": m["support"],
+                })
             rows.append(r)
 
     if not rows:
@@ -121,6 +133,20 @@ def main():
     out_dir = REPO / "outputs" / "multiseed"
     out_dir.mkdir(parents=True, exist_ok=True)
     df.to_csv(out_dir / "multiseed_finegrid_resultados.csv", index=False)
+
+    per_rel_df = pd.DataFrame(per_rel_rows)
+    per_rel_df.to_csv(out_dir / "multiseed_finegrid_per_relation.csv", index=False)
+
+    print("\n" + "=" * 70)
+    print("=== F1 por relacion en el threshold OPTIMO, media +/- std entre seeds ===")
+    per_rel_agg = (per_rel_df.groupby(["exp", "relation"])["f1"]
+                   .agg(["mean", "std", "count"]).reset_index())
+    pivot_rel = per_rel_agg.pivot(index="relation", columns="exp", values="mean")
+    pivot_rel["media_todos_encoders"] = pivot_rel.mean(axis=1)
+    pivot_rel = pivot_rel.sort_values("media_todos_encoders")
+    print(pivot_rel.round(3).to_string())
+    print(f"\nGuardado: outputs/multiseed/multiseed_finegrid_per_relation.csv "
+          f"(P/R/F1/soporte por encoder x seed x relacion, en el threshold optimo de cada uno)")
 
     print("\n" + "=" * 70)
     print(f"=== Media +/- std por encoder (fino, n={df.groupby('exp').size().to_dict()}) ===")

@@ -41,6 +41,15 @@ def patch():
     # Fix 3: num_workers default 8 -> 0
     dl_text = dl_text.replace("num_workers=8", "num_workers=0")
 
+    # Fix 4: eval(line) -> json.loads(line). eval() treats each data line as a
+    # Python literal, which happens to work for this project's original data
+    # (no lowercase true/false/null ever appeared in it) but breaks the
+    # moment a JSONL file has a real JSON boolean/null -- e.g. a "synthetic":
+    # true field added by an augmentation script. json is already imported
+    # in this module, so this is a drop-in replacement with no behavior
+    # change on data that was eval-safe before.
+    dl_text = dl_text.replace("self.data.append(eval(line))", "self.data.append(json.loads(line))")
+
     if dl_text != dl_orig:
         dl_path.write_text(dl_text, encoding="utf-8")
         patched.append(str(dl_path))
@@ -147,6 +156,126 @@ def fix_large_model_hidden_size():
         self.linear = nn.Linear(self.hidden_size, self.hidden_size)
 
     BERTEntityEncoder.__init__ = _patched_init
+
+
+def fix_universal_encoder():
+    """Monkeypatch BERTEntityEncoder to work with any AutoModel/AutoTokenizer
+    backbone, not just BERT -- in particular XLM-RoBERTa (SentencePiece).
+
+    Supersedes fix_large_model_hidden_size(): also derives hidden_size from
+    the loaded model's config, so it covers "large" backbones too.
+
+    OpenNRE hardcodes BertModel + BertTokenizer + the literal strings
+    '[CLS]'/'[SEP]' + pad id 0 + '[unused0]'-'[unused3]' entity markers.
+    Every WordPiece/BERT-vocab backbone already used in this TFG (PubMedBERT,
+    BioLinkBERT base/large, BioBERT, SciBERT, BiomedBERT-large) happens to
+    satisfy all of those assumptions (cls_token='[CLS]', sep_token='[SEP]',
+    pad_token_id=0), so for them this patch is behavior-preserving:
+    AutoModel/AutoTokenizer resolve to the exact same classes, and
+    tokenize() produces byte-identical output -- whatever pre-existing state
+    the '[unused]' markers have per vocab (some collide with [UNK], see
+    fix_entity_markers) is left exactly as before, so results already saved
+    for those encoders stay reproducible.
+
+    XLM-RoBERTa breaks every one of those assumptions: cls_token='<s>',
+    sep_token='</s>', pad_token_id=1, and '[unused0]'-'[unused5]' don't
+    exist in its SentencePiece vocab at all (they'd silently collapse to
+    <unk>, and padding with the hardcoded 0 would inject spurious '<s>'
+    tokens into the padded region). This patch detects any backbone like
+    that (tokenizer doesn't already match the BERT convention) and takes
+    the safe path validated in the original XLM-RoBERTa experiment: register
+    '[unused0]'-'[unused5]' as real tokens with embeddings initialized to
+    the MEAN of the existing embedding matrix (random init made the model
+    collapse to predicting only 'no_relation'), and use the tokenizer's own
+    cls/sep/pad tokens instead of the hardcoded BERT ones.
+    """
+    from opennre.encoder.bert_encoder import BERTEntityEncoder
+    from transformers import AutoModel, AutoTokenizer
+    from torch import nn
+    import torch
+
+    ENTITY_MARKERS = ["[unused0]", "[unused1]", "[unused2]",
+                      "[unused3]", "[unused4]", "[unused5]"]
+
+    def _patched_init(self, max_length, pretrain_path, blank_padding=True, mask_entity=False):
+        nn.Module.__init__(self)
+        self.max_length = max_length
+        self.blank_padding = blank_padding
+        self.mask_entity = mask_entity
+        self.bert = AutoModel.from_pretrained(pretrain_path)
+        self.tokenizer = AutoTokenizer.from_pretrained(pretrain_path, use_fast=False)
+
+        is_bert_vocab = (self.tokenizer.cls_token == "[CLS]"
+                          and self.tokenizer.sep_token == "[SEP]"
+                          and self.tokenizer.pad_token_id == 0)
+        if not is_bert_vocab:
+            new_tokens = [t for t in ENTITY_MARKERS if t not in self.tokenizer.get_vocab()]
+            if new_tokens:
+                self.tokenizer.add_tokens(new_tokens)
+                self.bert.resize_token_embeddings(len(self.tokenizer))
+                with torch.no_grad():
+                    n_new = len(new_tokens)
+                    emb = self.bert.get_input_embeddings().weight
+                    mean = emb[:-n_new].mean(dim=0)
+                    emb[-n_new:] = mean.unsqueeze(0).repeat(n_new, 1)
+
+        self.hidden_size = self.bert.config.hidden_size * 2
+        self.linear = nn.Linear(self.hidden_size, self.hidden_size)
+
+    def _patched_tokenize(self, item):
+        is_token = "text" not in item
+        sentence = item["token"] if is_token else item["text"]
+        pos_head = item["h"]["pos"]
+        pos_tail = item["t"]["pos"]
+
+        if pos_head[0] > pos_tail[0]:
+            pos_min, pos_max, rev = pos_tail, pos_head, True
+        else:
+            pos_min, pos_max, rev = pos_head, pos_tail, False
+
+        def tok(s):
+            s = " ".join(s) if is_token else s
+            return self.tokenizer.tokenize(s) if s else []
+
+        sent0 = tok(sentence[:pos_min[0]])
+        ent0 = tok(sentence[pos_min[0]:pos_min[1]])
+        sent1 = tok(sentence[pos_min[1]:pos_max[0]])
+        ent1 = tok(sentence[pos_max[0]:pos_max[1]])
+        sent2 = tok(sentence[pos_max[1]:])
+
+        if self.mask_entity:
+            ent0 = ["[unused4]"] if not rev else ["[unused5]"]
+            ent1 = ["[unused5]"] if not rev else ["[unused4]"]
+        else:
+            ent0 = ["[unused0]"] + ent0 + ["[unused1]"] if not rev else ["[unused2]"] + ent0 + ["[unused3]"]
+            ent1 = ["[unused2]"] + ent1 + ["[unused3]"] if not rev else ["[unused0]"] + ent1 + ["[unused1]"]
+
+        re_tokens = [self.tokenizer.cls_token] + sent0 + ent0 + sent1 + ent1 + sent2 + [self.tokenizer.sep_token]
+
+        pos1 = 1 + len(sent0) if not rev else 1 + len(sent0 + ent0 + sent1)
+        pos2 = 1 + len(sent0 + ent0 + sent1) if not rev else 1 + len(sent0)
+        pos1 = min(self.max_length - 1, pos1)
+        pos2 = min(self.max_length - 1, pos2)
+
+        indexed_tokens = self.tokenizer.convert_tokens_to_ids(re_tokens)
+        avai_len = len(indexed_tokens)
+        pos1 = torch.tensor([[pos1]]).long()
+        pos2 = torch.tensor([[pos2]]).long()
+
+        pad_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
+        if self.blank_padding:
+            while len(indexed_tokens) < self.max_length:
+                indexed_tokens.append(pad_id)
+            indexed_tokens = indexed_tokens[:self.max_length]
+        indexed_tokens = torch.tensor(indexed_tokens).long().unsqueeze(0)
+
+        att_mask = torch.zeros(indexed_tokens.size()).long()
+        att_mask[0, :avai_len] = 1
+
+        return indexed_tokens, att_mask, pos1, pos2
+
+    BERTEntityEncoder.__init__ = _patched_init
+    BERTEntityEncoder.tokenize = _patched_tokenize
 
 
 def fix_nested_entity_tokenize():
@@ -370,6 +499,159 @@ def fix_entity_markers():
 
     BERTEntityEncoder.__init__ = _patched_init
     BERTEntityEncoder.tokenize = _patched_tokenize
+
+
+def fix_universal_encoder_with_markers():
+    """Version backbone-agnostic de fix_entity_markers(): combina el soporte
+    AutoModel/AutoTokenizer de fix_universal_encoder() con los marcadores
+    dedicados y el tokenize() consciente de anidamiento de fix_entity_markers()
+    (ver HALLAZGOS-BUGS-TOKENIZACION.md, Bug 1 y Bug 2).
+
+    fix_universal_encoder() decide si reutilizar [unused0]-[unused5] mirando
+    si cls/sep/pad "parecen" BERT (`cls_token=='[CLS]'`, `sep_token=='[SEP]'`,
+    `pad_token_id==0`). Esa comprobacion no es suficiente: el tokenizer de
+    DeBERTa-v3 la pasa (usa exactamente esos tokens) pero su vocabulario no
+    reserva huecos [unused] de verdad -- `convert_tokens_to_ids('[unused0]')`
+    devuelve el mismo id que `[UNK]` (comprobado: los 4 marcadores colapsan a
+    id=3), el mismo fallo que Bug 2 documento para PubMedBERT/BioLinkBERT-base/
+    BioBERT. "Parecer BERT" en cls/sep/pad no implica tener huecos [unused]
+    reales.
+
+    Por eso esta version SIEMPRE anade tokens nuevos y dedicados
+    ([E1]/[/E1]/[E2]/[/E2] + variantes MASK) via `add_special_tokens`, sin
+    importar el backbone -- evita depender de que el vocabulario tenga huecos
+    libres, sea cual sea. Los embeddings nuevos se inicializan a la MEDIA de
+    la matriz existente (no al init por defecto de `resize_token_embeddings`):
+    es el criterio ya validado en `fix_universal_encoder()` para XLM-RoBERTa,
+    donde el init por defecto colapsaba el modelo a predecir solo
+    'no_relation'.
+
+    Incluye tambien el tokenize() de `fix_nested_entity_tokenize()`/
+    `fix_entity_markers()` (Bug 1): corta la frase por la union de los 4
+    bordes de entidad en vez de asumir que head y tail nunca se solapan.
+
+    Tambien parchea forward(): el original hace
+    `hidden, _ = self.bert(..., return_dict=False)` asumiendo que el backbone
+    siempre devuelve (last_hidden_state, pooler_output). Backbones sin capa de
+    pooler (DebertaV2Model, entre otros) devuelven una tupla de un solo
+    elemento con return_dict=False, y ese unpacking revienta con
+    "not enough values to unpack". El fix toma `[0]` (siempre
+    last_hidden_state, el unico dato que BERTEntityEncoder usa) en vez de
+    asumir la longitud de la tupla.
+    """
+    from opennre.encoder.bert_encoder import BERTEntityEncoder
+    from transformers import AutoModel, AutoTokenizer
+    from torch import nn
+    import torch
+
+    HEAD_OPEN, HEAD_CLOSE = "[E1]", "[/E1]"
+    TAIL_OPEN, TAIL_CLOSE = "[E2]", "[/E2]"
+    MASK_HEAD, MASK_TAIL = "[E1-MASK]", "[E2-MASK]"
+    NEW_TOKENS = [HEAD_OPEN, HEAD_CLOSE, TAIL_OPEN, TAIL_CLOSE, MASK_HEAD, MASK_TAIL]
+
+    def _patched_init(self, max_length, pretrain_path, blank_padding=True, mask_entity=False):
+        nn.Module.__init__(self)
+        self.max_length = max_length
+        self.blank_padding = blank_padding
+        self.mask_entity = mask_entity
+        # dtype=torch.float32 explicito: transformers>=5 carga cada checkpoint
+        # en el dtype con el que se subio a HF Hub si no se especifica lo
+        # contrario -- microsoft/deberta-v3-base esta en fp16. Entrenar fp16
+        # con un optimizer/clip_grad_norm_ pensados para fp32 (sin loss
+        # scaling, como el resto de este pipeline) diverge a NaN en el primer
+        # optimizer step (comprobado: loss=nan ya en el segundo batch).
+        self.bert = AutoModel.from_pretrained(pretrain_path, dtype=torch.float32)
+        self.tokenizer = AutoTokenizer.from_pretrained(pretrain_path, use_fast=False)
+
+        new_tokens = [t for t in NEW_TOKENS if t not in self.tokenizer.get_vocab()]
+        if new_tokens:
+            self.tokenizer.add_special_tokens({"additional_special_tokens": new_tokens})
+            self.bert.resize_token_embeddings(len(self.tokenizer))
+            with torch.no_grad():
+                n_new = len(new_tokens)
+                emb = self.bert.get_input_embeddings().weight
+                mean = emb[:-n_new].mean(dim=0)
+                emb[-n_new:] = mean.unsqueeze(0).repeat(n_new, 1)
+
+        self.hidden_size = self.bert.config.hidden_size * 2
+        self.linear = nn.Linear(self.hidden_size, self.hidden_size)
+
+    def _patched_tokenize(self, item):
+        is_token = "text" not in item
+        sentence = item["token"] if is_token else item["text"]
+        h_start, h_end = item["h"]["pos"]
+        t_start, t_end = item["t"]["pos"]
+
+        def tok(s):
+            s = " ".join(s) if is_token else s
+            return self.tokenizer.tokenize(s) if s else []
+
+        n = len(sentence)
+        cuts = sorted(set([0, h_start, h_end, t_start, t_end, n]))
+        opens_at, closes_at = {}, {}
+        opens_at.setdefault(h_start, []).append("h")
+        opens_at.setdefault(t_start, []).append("t")
+        closes_at.setdefault(h_end, []).append("h")
+        closes_at.setdefault(t_end, []).append("t")
+
+        if self.mask_entity:
+            head_open, head_close = [MASK_HEAD], []
+            tail_open, tail_close = [MASK_TAIL], []
+        else:
+            head_open, head_close = [HEAD_OPEN], [HEAD_CLOSE]
+            tail_open, tail_close = [TAIL_OPEN], [TAIL_CLOSE]
+
+        re_tokens = [self.tokenizer.cls_token]
+        pos1 = pos2 = None
+        for i in range(len(cuts) - 1):
+            a, b = cuts[i], cuts[i + 1]
+            for who in closes_at.get(a, []):
+                re_tokens += head_close if who == "h" else tail_close
+            for who in opens_at.get(a, []):
+                if who == "h":
+                    pos1 = len(re_tokens); re_tokens += head_open
+                else:
+                    pos2 = len(re_tokens); re_tokens += tail_open
+            if b > a:
+                re_tokens += tok(sentence[a:b])
+        for who in closes_at.get(cuts[-1], []):
+            re_tokens += head_close if who == "h" else tail_close
+        re_tokens.append(self.tokenizer.sep_token)
+
+        pos1 = min(self.max_length - 1, pos1)
+        pos2 = min(self.max_length - 1, pos2)
+        indexed_tokens = self.tokenizer.convert_tokens_to_ids(re_tokens)
+        avai_len = len(indexed_tokens)
+        pos1 = torch.tensor([[pos1]]).long()
+        pos2 = torch.tensor([[pos2]]).long()
+
+        pad_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
+        if self.blank_padding:
+            while len(indexed_tokens) < self.max_length:
+                indexed_tokens.append(pad_id)
+            indexed_tokens = indexed_tokens[:self.max_length]
+        indexed_tokens = torch.tensor(indexed_tokens).long().unsqueeze(0)
+
+        att_mask = torch.zeros(indexed_tokens.size()).long()
+        att_mask[0, :avai_len] = 1
+
+        return indexed_tokens, att_mask, pos1, pos2
+
+    def _patched_forward(self, token, att_mask, pos1, pos2):
+        hidden = self.bert(token, attention_mask=att_mask, return_dict=False)[0]
+        onehot_head = torch.zeros(hidden.size()[:2]).float().to(hidden.device)
+        onehot_tail = torch.zeros(hidden.size()[:2]).float().to(hidden.device)
+        onehot_head = onehot_head.scatter_(1, pos1, 1)
+        onehot_tail = onehot_tail.scatter_(1, pos2, 1)
+        head_hidden = (onehot_head.unsqueeze(2) * hidden).sum(1)
+        tail_hidden = (onehot_tail.unsqueeze(2) * hidden).sum(1)
+        x = torch.cat([head_hidden, tail_hidden], 1)
+        x = self.linear(x)
+        return x
+
+    BERTEntityEncoder.__init__ = _patched_init
+    BERTEntityEncoder.tokenize = _patched_tokenize
+    BERTEntityEncoder.forward = _patched_forward
 
 
 if __name__ == "__main__":
